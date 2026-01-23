@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "Hermes",
+			"path": "../../Hermes"
+		},
+		{
+			"name": "Hermes_Orchestrator",
+			"path": "../../Hermes_Orchestrator"
+		},
+		{
+			"name": "Hermes_Manager",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
