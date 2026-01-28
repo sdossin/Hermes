@@ -1,8 +1,9 @@
 // SerialConsole.cpp
-// Minimal serial console for a single Encoder object.
+// Minimal serial console for a single Encoder + optional MotorController.
 
 #include "SerialConsole.hpp"
 #include "Encoder.hpp"
+#include "MotorController.hpp"
 
 #include <cstdarg>
 #include <cstdio>
@@ -11,7 +12,6 @@
 
 #if defined(ARDUINO)
   #include <Arduino.h>
-  // Avoid macro collision with enums named DISABLED, etc.
   #ifdef DISABLED
     #undef DISABLED
   #endif
@@ -20,12 +20,22 @@
 SerialConsole::SerialConsole() = default;
 
 void SerialConsole::begin(Encoder* enc) {
-  begin(enc, Config{});
+  begin(enc, nullptr, Config{});
 }
 
 void SerialConsole::begin(Encoder* enc, const Config& cfg) {
+  begin(enc, nullptr, cfg);
+}
+
+void SerialConsole::begin(Encoder* enc, MotorController* motor) {
+  begin(enc, motor, Config{});
+}
+
+void SerialConsole::begin(Encoder* enc, MotorController* motor, const Config& cfg) {
   enc_ = enc;
+  motor_ = motor;
   cfg_ = cfg;
+
   line_len_ = 0;
   watch_on_ = false;
   watch_period_ms_ = cfg_.watch_period_ms;
@@ -38,7 +48,7 @@ void SerialConsole::begin(Encoder* enc, const Config& cfg) {
   while (!Serial) { /* wait */ }
 #endif
 
-  write_("=-=-=-=-=-=-=-=-=-=-   Hermes   -=-=-=-=-=-=-=-=-=-=\n ");
+  write_("=-=-=-=-=-=-=-=-=-=-   Hermes   -=-=-=-=-=-=-=-=-=-=\n");
   cmd_help_();
   write_("\n> ");
 }
@@ -73,7 +83,6 @@ void SerialConsole::poll(uint32_t now_ms) {
     if (line_len_ + 1 < kLineMax) {
       line_[line_len_++] = static_cast<char>(ch);
     } else {
-      // overflow -> reset
       line_len_ = 0;
     }
   }
@@ -119,33 +128,38 @@ int SerialConsole::tokenize_(char* buf, char* argv[], int max_argv) {
 }
 
 void SerialConsole::handle_line_(uint32_t now_ms, const char* line) {
-  // If watch is running, its output uses ' and can collide with user input.
+  // If watch is running, its output uses '\r' and can collide with user input.
   // Print a newline before echoing the command for readability.
-  if (watch_on_) write_("");
+  if (watch_on_) write_("\n");
 
   // Echo the command back to the user.
-  writef_("%s\n\n", line);
+  writef_("> %s\n", line);
 
   char buf[kLineMax];
   std::snprintf(buf, sizeof(buf), "%s", line);
 
-  char* argv[10];
-  const int argc = tokenize_(buf, argv, 10);
-  if (argc == 0) return;
+  char* argv[12];
+  const int argc = tokenize_(buf, argv, 12);
+  if (argc == 0) {
+    write_("> ");
+    return;
+  }
 
   const char* c = argv[0];
 
-  if (!std::strcmp(c, "help")) { cmd_help_(); }
-  else if (!std::strcmp(c, "status")) { cmd_status_(now_ms); }
-  else if (!std::strcmp(c, "read")) { cmd_read_(now_ms); }
-  else if (!std::strcmp(c, "watch")) { cmd_watch_(now_ms, argc, argv); }
-  else if (!std::strcmp(c, "invert")) { cmd_invert_(argc, argv); }
-  else if (!std::strcmp(c, "zero")) { cmd_zero_(); }
-  else if (!std::strcmp(c, "set")) { cmd_set_(argc, argv); }
-  else if (!std::strcmp(c, "offset")) { cmd_offset_(argc, argv); }
-  else if (!std::strcmp(c, "probe")) { cmd_probe_(); }
-  else write_("ERR: unknown command. type 'help'");
-  write_("\n > ");
+  if (!std::strcmp(c, "help")) cmd_help_();
+  else if (!std::strcmp(c, "status")) cmd_status_(now_ms);
+  else if (!std::strcmp(c, "read")) cmd_read_(now_ms);
+  else if (!std::strcmp(c, "watch")) cmd_watch_(now_ms, argc, argv);
+  else if (!std::strcmp(c, "invert")) cmd_invert_(argc, argv);
+  else if (!std::strcmp(c, "zero")) cmd_zero_();
+  else if (!std::strcmp(c, "set")) cmd_set_(argc, argv);
+  else if (!std::strcmp(c, "offset")) cmd_offset_(argc, argv);
+  else if (!std::strcmp(c, "probe")) cmd_probe_();
+  else if (!std::strcmp(c, "m")) cmd_motor_(now_ms, argc, argv);
+  else write_("ERR: unknown command. type 'help'\n");
+
+  write_("> ");
 }
 
 // ---------------- Commands ----------------
@@ -158,11 +172,18 @@ void SerialConsole::cmd_help_() {
     "  status                (read+print)\n"
     "  read                  (same as status)\n"
     "  watch on|off\n"
-    "  watch rate <ms>       (period in ms; updates in-place with \\r)\n"
+    "  watch rate <ms>       (period in ms; watch updates in-place with \\r)\n"
     "  invert on|off\n"
     "  zero                  (set current angle to 0)\n"
     "  set <deg>             (set current angle to <deg>)\n"
     "  offset <deg>          (directly set offset)\n"
+    "\n"
+    "Motor (if present):\n"
+    "  m help\n"
+    "  m status\n"
+    "  m enable on|off\n"
+    "  m out <u1> <u2> <u3>  (each in [-1,1])\n"
+    "  m stop\n"
   );
 }
 
@@ -172,35 +193,46 @@ void SerialConsole::cmd_probe_() {
 }
 
 void SerialConsole::cmd_status_(uint32_t now_ms) {
-  // Trigger a fresh read for convenience
   enc_->read(now_ms);
   const auto& r = enc_->last();
 
-  if (!r.ok) {
-    writef_("Encoder:\n\tstatus: ERROR\n\ti2c_error: %u", (unsigned)r.i2c_error);
+  if (printing_watch_) {
+    // One-line, in-place update for watch mode
+    if (!r.ok) {
+      writef_("raw12=---- raw_deg=---.--- deg=---.--- vel=---.--- inv=----- off=---.--- ERR(i2c=%u)\r",
+              (unsigned)r.i2c_error);
+      return;
+    }
+
+    writef_(
+      "raw12=%4u raw_deg=%7.3f deg=%7.3f vel=%8.3f inv=%5s off=%7.3f\r",
+      (unsigned)r.raw12,
+      r.deg_raw,
+      r.deg,
+      r.vel_dps,
+      enc_->invert() ? "true" : "false",
+      enc_->offset_deg()
+    );
     return;
   }
 
-//   write_("Encoder:\n");
-//   writef_("  raw12      : %u\n", (unsigned)r.raw12);
-//   writef_("  raw_deg    : %.3f\n", r.deg_raw);
-//   writef_("  deg        : %.3f\n", r.deg);
-//   writef_("  vel_dps    : %.3f\n", r.vel_dps);
-//   writef_("  invert     : %s\n", enc_->invert() ? "on" : "off");
-//   writef_("  offset_deg : %.3f\n", enc_->offset_deg());
+  // Multi-line for human readability
+  if (!r.ok) {
+    writef_("Encoder:\n  status: ERROR\n  i2c_error: %u\n", (unsigned)r.i2c_error);
+    return;
+  }
 
-  writef_("  raw12 = %4u    raw_deg = %07.3f    deg = %07.3f    vel_dps = %08.3f    invert = %s    offset_deg = %07.3f\r", 
-        (unsigned)r.raw12,
-        r.deg_raw,
-        r.deg,
-        r.vel_dps,
-        enc_->invert() ? "true " : "false",
-        enc_->offset_deg()
-    );
+  write_("Encoder:\n");
+  writef_("  status     : OK\n");
+  writef_("  raw12      : %u\n", (unsigned)r.raw12);
+  writef_("  raw_deg    : %.3f\n", r.deg_raw);
+  writef_("  deg        : %.3f\n", r.deg);
+  writef_("  vel_dps    : %.3f\n", r.vel_dps);
+  writef_("  invert     : %s\n", enc_->invert() ? "true" : "false");
+  writef_("  offset_deg : %.3f\n", enc_->offset_deg());
 }
 
 void SerialConsole::cmd_read_(uint32_t now_ms) {
-  // Ensure read prints a newline even if watch is currently on.
   const bool prev = printing_watch_;
   printing_watch_ = false;
   cmd_status_(now_ms);
@@ -222,7 +254,6 @@ void SerialConsole::cmd_watch_(uint32_t now_ms, int argc, char* argv[]) {
   }
   if (!std::strcmp(argv[1], "off")) {
     watch_on_ = false;
-    // When watch ends, print a newline to avoid leaving prompt mid-line.
     write_("\nwatch: off\n");
     return;
   }
@@ -238,7 +269,7 @@ void SerialConsole::cmd_watch_(uint32_t now_ms, int argc, char* argv[]) {
 
 void SerialConsole::cmd_invert_(int argc, char* argv[]) {
   if (argc < 2) {
-    writef_("invert: %s\n", enc_->invert() ? "on" : "off");
+    writef_("invert: %s\n", enc_->invert() ? "true" : "false");
     return;
   }
   const bool on = (!std::strcmp(argv[1], "on") || !std::strcmp(argv[1], "1") || !std::strcmp(argv[1], "true"));
@@ -278,9 +309,81 @@ void SerialConsole::cmd_set_(int argc, char* argv[]) {
 
 void SerialConsole::cmd_offset_(int argc, char* argv[]) {
   if (argc < 2) {
-    writef_("offset: %.2f\n", enc_->offset_deg());
+    writef_("offset: %.3f\n", enc_->offset_deg());
     return;
   }
   enc_->set_offset_deg(std::atof(argv[1]));
   write_("ok\n");
+}
+
+void SerialConsole::cmd_motor_(uint32_t now_ms, int argc, char* argv[]) {
+  (void)now_ms;
+  if (!motor_) {
+    write_("motor: not configured\n");
+    return;
+  }
+
+  if (argc < 2) {
+    write_("ERR: m help|status|enable|out|stop\n");
+    return;
+  }
+
+  const char* sub = argv[1];
+
+  if (!std::strcmp(sub, "help")) {
+    write_(
+      "m commands:\n"
+      "  m status\n"
+      "  m enable on|off\n"
+      "  m out <u1> <u2> <u3>   (each in [-1,1])\n"
+      "  m stop\n"
+    );
+    return;
+  }
+
+  if (!std::strcmp(sub, "status")) {
+    const auto& s = motor_->state();
+    write_("Motor:\n");
+    writef_("  configured: %s\n", s.configured ? "true" : "false");
+    writef_("  enabled   : %s\n", s.enabled ? "true" : "false");
+    writef_("  u1 u2 u3  : %.3f %.3f %.3f\n", s.u1, s.u2, s.u3);
+    return;
+  }
+
+  if (!std::strcmp(sub, "enable")) {
+    if (argc < 3) {
+      write_("ERR: m enable on|off\n");
+      return;
+    }
+    const bool on = (!std::strcmp(argv[2], "on") || !std::strcmp(argv[2], "1") || !std::strcmp(argv[2], "true"));
+    const bool off = (!std::strcmp(argv[2], "off") || !std::strcmp(argv[2], "0") || !std::strcmp(argv[2], "false"));
+    if (!on && !off) {
+      write_("ERR: m enable on|off\n");
+      return;
+    }
+    motor_->enable(on);
+    write_("ok\n");
+    return;
+  }
+
+  if (!std::strcmp(sub, "out")) {
+    if (argc < 5) {
+      write_("ERR: m out <u1> <u2> <u3>\n");
+      return;
+    }
+    const float u1 = std::atof(argv[2]);
+    const float u2 = std::atof(argv[3]);
+    const float u3 = std::atof(argv[4]);
+    motor_->set_outputs(u1, u2, u3);
+    write_("ok\n");
+    return;
+  }
+
+  if (!std::strcmp(sub, "stop")) {
+    motor_->stop();
+    write_("ok\n");
+    return;
+  }
+
+  write_("ERR: m help|status|enable|out|stop\n");
 }
