@@ -1,5 +1,5 @@
 // SerialConsole.cpp
-// Minimal serial console for a single Encoder + optional MotorController.
+// Minimal serial console for a single AS5600Encoder + optional MotorController.
 
 #include "SerialConsole.hpp"
 #include "Encoder.hpp"
@@ -19,19 +19,19 @@
 
 SerialConsole::SerialConsole() = default;
 
-void SerialConsole::begin(Encoder* enc) {
+void SerialConsole::begin(AS5600Encoder* enc) {
   begin(enc, nullptr, Config{});
 }
 
-void SerialConsole::begin(Encoder* enc, const Config& cfg) {
+void SerialConsole::begin(AS5600Encoder* enc, const Config& cfg) {
   begin(enc, nullptr, cfg);
 }
 
-void SerialConsole::begin(Encoder* enc, MotorController* motor) {
+void SerialConsole::begin(AS5600Encoder* enc, MotorController* motor) {
   begin(enc, motor, Config{});
 }
 
-void SerialConsole::begin(Encoder* enc, MotorController* motor, const Config& cfg) {
+void SerialConsole::begin(AS5600Encoder* enc, MotorController* motor, const Config& cfg) {
   enc_ = enc;
   motor_ = motor;
   cfg_ = cfg;
@@ -182,8 +182,15 @@ void SerialConsole::cmd_help_() {
     "  m help\n"
     "  m status\n"
     "  m enable on|off\n"
-    "  m out <u1> <u2> <u3>  (each in [-1,1])\n"
+    "  m out <u1> <u2> <u3>  (each in [-1,1], PWM mode only)\n"
     "  m stop\n"
+    "\n"
+    "FOC (SimpleFOC control):\n"
+    "  m foc enable|disable\n"
+    "  m foc mode angle|velocity|torque\n"
+    "  m foc target <value>  (deg, deg/s, or V depending on mode)\n"
+    "  m foc tune vel <p> <i> <d>\n"
+    "  m foc tune pos <p> <i> <d>\n"
   );
 }
 
@@ -218,11 +225,11 @@ void SerialConsole::cmd_status_(uint32_t now_ms) {
 
   // Multi-line for human readability
   if (!r.ok) {
-    writef_("Encoder:\n  status: ERROR\n  i2c_error: %u\n", (unsigned)r.i2c_error);
+    writef_("AS5600Encoder:\n  status: ERROR\n  i2c_error: %u\n", (unsigned)r.i2c_error);
     return;
   }
 
-  write_("Encoder:\n");
+  write_("AS5600Encoder:\n");
   writef_("  status     : OK\n");
   writef_("  raw12      : %u\n", (unsigned)r.raw12);
   writef_("  raw_deg    : %.3f\n", r.deg_raw);
@@ -324,7 +331,7 @@ void SerialConsole::cmd_motor_(uint32_t now_ms, int argc, char* argv[]) {
   }
 
   if (argc < 2) {
-    write_("ERR: m help|status|enable|out|stop\n");
+    write_("ERR: m help|status|enable|out|stop|foc\n");
     return;
   }
 
@@ -335,8 +342,18 @@ void SerialConsole::cmd_motor_(uint32_t now_ms, int argc, char* argv[]) {
       "m commands:\n"
       "  m status\n"
       "  m enable on|off\n"
-      "  m out <u1> <u2> <u3>   (each in [-1,1])\n"
+      "  m out <u1> <u2> <u3>   (each in [-1,1], PWM mode only)\n"
       "  m stop\n"
+      "\n"
+      "FOC commands:\n"
+      "  m foc enable\n"
+      "  m foc disable\n"
+      "  m foc mode angle|velocity|torque\n"
+      "  m foc target <value>\n"
+      "  m foc tune vel <p> <i> <d>\n"
+      "  m foc tune pos <p> <i> <d>\n"
+      "  m foc limits volt <v>\n"
+      "  m foc limits vel <dps>\n"
     );
     return;
   }
@@ -346,7 +363,15 @@ void SerialConsole::cmd_motor_(uint32_t now_ms, int argc, char* argv[]) {
     write_("Motor:\n");
     writef_("  configured: %s\n", s.configured ? "true" : "false");
     writef_("  enabled   : %s\n", s.enabled ? "true" : "false");
-    writef_("  u1 u2 u3  : %.3f %.3f %.3f\n", s.u1, s.u2, s.u3);
+    writef_("  foc_mode  : %s\n", s.foc_mode ? "true" : "false");
+    if (s.foc_mode) {
+      writef_("  control   : %s\n", s.control_mode);
+      writef_("  target    : %.2f\n", s.target);
+      writef_("  angle     : %.2f deg\n", s.current_angle);
+      writef_("  velocity  : %.2f deg/s\n", s.current_velocity);
+    } else {
+      writef_("  u1 u2 u3  : %.3f %.3f %.3f\n", s.u1, s.u2, s.u3);
+    }
     return;
   }
 
@@ -385,5 +410,103 @@ void SerialConsole::cmd_motor_(uint32_t now_ms, int argc, char* argv[]) {
     return;
   }
 
-  write_("ERR: m help|status|enable|out|stop\n");
+  // FOC commands
+  if (!std::strcmp(sub, "foc")) {
+    if (argc < 3) {
+      write_("ERR: m foc enable|disable|mode|target|tune|limits\n");
+      return;
+    }
+
+    const char* foc_cmd = argv[2];
+
+    if (!std::strcmp(foc_cmd, "enable")) {
+      motor_->foc_enable();
+      write_("ok\n");
+      return;
+    }
+
+    if (!std::strcmp(foc_cmd, "disable")) {
+      motor_->foc_disable();
+      write_("ok\n");
+      return;
+    }
+
+    if (!std::strcmp(foc_cmd, "mode")) {
+      if (argc < 4) {
+        write_("ERR: m foc mode angle|velocity|torque\n");
+        return;
+      }
+      const char* mode = argv[3];
+      if (!std::strcmp(mode, "angle") || !std::strcmp(mode, "position")) {
+        motor_->foc_set_mode_angle();
+      } else if (!std::strcmp(mode, "velocity") || !std::strcmp(mode, "vel")) {
+        motor_->foc_set_mode_velocity();
+      } else if (!std::strcmp(mode, "torque")) {
+        motor_->foc_set_mode_torque();
+      } else {
+        write_("ERR: unknown mode\n");
+        return;
+      }
+      write_("ok\n");
+      return;
+    }
+
+    if (!std::strcmp(foc_cmd, "target")) {
+      if (argc < 4) {
+        write_("ERR: m foc target <value>\n");
+        return;
+      }
+      const float target = std::atof(argv[3]);
+      motor_->foc_set_target(target);
+      write_("ok\n");
+      return;
+    }
+
+    if (!std::strcmp(foc_cmd, "tune")) {
+      if (argc < 7) {
+        write_("ERR: m foc tune vel|pos <p> <i> <d>\n");
+        return;
+      }
+      const char* type = argv[3];
+      const float p = std::atof(argv[4]);
+      const float i = std::atof(argv[5]);
+      const float d = std::atof(argv[6]);
+      
+      if (!std::strcmp(type, "vel") || !std::strcmp(type, "velocity")) {
+        motor_->foc_tune_velocity(p, i, d);
+      } else if (!std::strcmp(type, "pos") || !std::strcmp(type, "position")) {
+        motor_->foc_tune_position(p, i, d);
+      } else {
+        write_("ERR: unknown tune type\n");
+        return;
+      }
+      write_("ok\n");
+      return;
+    }
+
+    if (!std::strcmp(foc_cmd, "limits")) {
+      if (argc < 5) {
+        write_("ERR: m foc limits volt|vel <value>\n");
+        return;
+      }
+      const char* type = argv[3];
+      const float val = std::atof(argv[4]);
+      
+      if (!std::strcmp(type, "volt") || !std::strcmp(type, "voltage")) {
+        motor_->foc_set_voltage_limit(val);
+      } else if (!std::strcmp(type, "vel") || !std::strcmp(type, "velocity")) {
+        motor_->foc_set_velocity_limit(val);
+      } else {
+        write_("ERR: unknown limit type\n");
+        return;
+      }
+      write_("ok\n");
+      return;
+    }
+
+    write_("ERR: unknown foc command\n");
+    return;
+  }
+
+  write_("ERR: m help|status|enable|out|stop|foc\n");
 }

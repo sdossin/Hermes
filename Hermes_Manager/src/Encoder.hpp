@@ -1,4 +1,4 @@
-// Encoder.hpp
+// AS5600Encoder.hpp
 // Single-encoder support for ESP32 + AS5600 over I2C (Arduino Wire).
 // All sensor communication + calibration math is contained in this object.
 #pragma once
@@ -8,7 +8,7 @@
 // Forward-declare TwoWire to avoid pulling Arduino headers into everyone.
 class TwoWire;
 
-class Encoder {
+class AS5600Encoder {
 public:
   struct Config {
     uint8_t i2c_addr = 0x36;      // AS5600 default
@@ -36,7 +36,7 @@ public:
     uint8_t i2c_error = 0;    // 0 if OK; otherwise Wire error codes
   };
 
-  Encoder();
+  AS5600Encoder();
 
   // Provide the Wire instance you want to use (typically &Wire).
   // Call begin() once in setup().
@@ -84,7 +84,7 @@ private:
   Config cfg_{};
 
   Reading last_{};
-  bool invert_ = false;
+  bool invert_ = true;
   float offset_deg_ = 0.0f;
 
   // For velocity estimation

@@ -1,4 +1,4 @@
-// Encoder.cpp
+// AS5600Encoder.cpp
 // Single-encoder support for ESP32 + AS5600 over I2C (Arduino Wire).
 
 #include "Encoder.hpp"
@@ -8,9 +8,9 @@
   #include <Wire.h>
 #endif
 
-Encoder::Encoder() = default;
+AS5600Encoder::AS5600Encoder() = default;
 
-void Encoder::begin(TwoWire* wire, const Config& cfg) {
+void AS5600Encoder::begin(TwoWire* wire, const Config& cfg) {
   wire_ = wire;
   cfg_ = cfg;
 
@@ -29,7 +29,7 @@ void Encoder::begin(TwoWire* wire, const Config& cfg) {
   prev_t_ms_ = 0;
 }
 
-bool Encoder::probe() {
+bool AS5600Encoder::probe() {
 #if defined(ARDUINO)
   if (!wire_) return false;
   wire_->beginTransmission(cfg_.i2c_addr);
@@ -40,7 +40,7 @@ bool Encoder::probe() {
 #endif
 }
 
-bool Encoder::read(uint32_t now_ms) {
+bool AS5600Encoder::read(uint32_t now_ms) {
   last_.t_ms = now_ms;
   last_.i2c_error = 0;
 
@@ -81,7 +81,7 @@ bool Encoder::read(uint32_t now_ms) {
   return true;
 }
 
-void Encoder::zero_here() {
+void AS5600Encoder::zero_here() {
   // Set offset so that current calibrated output becomes 0.
   // We compute offset based on last raw reading.
   const float raw_deg = last_.deg_raw;
@@ -89,13 +89,13 @@ void Encoder::zero_here() {
   offset_deg_ = wrap_(0.0f - signed_raw, cfg_.wrap_deg);
 }
 
-void Encoder::set_here(float desired_deg) {
+void AS5600Encoder::set_here(float desired_deg) {
   const float raw_deg = last_.deg_raw;
   const float signed_raw = invert_ ? -raw_deg : raw_deg;
   offset_deg_ = wrap_(desired_deg - signed_raw, cfg_.wrap_deg);
 }
 
-bool Encoder::read_raw12_(uint16_t& out_raw12) {
+bool AS5600Encoder::read_raw12_(uint16_t& out_raw12) {
 #if !defined(ARDUINO)
   (void)out_raw12;
   return false;
@@ -130,13 +130,13 @@ bool Encoder::read_raw12_(uint16_t& out_raw12) {
 #endif
 }
 
-float Encoder::apply_cal_(float raw_deg) const {
+float AS5600Encoder::apply_cal_(float raw_deg) const {
   const float signed_raw = invert_ ? -raw_deg : raw_deg;
   const float x = signed_raw + offset_deg_;
   return wrap_(x, cfg_.wrap_deg);
 }
 
-float Encoder::wrap_(float x, float wrap_deg) {
+float AS5600Encoder::wrap_(float x, float wrap_deg) {
   if (wrap_deg <= 0.0f) return x;
   // Bring into [0, wrap_deg)
   while (x >= wrap_deg) x -= wrap_deg;
