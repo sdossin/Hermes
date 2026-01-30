@@ -1,142 +1,135 @@
 // main.cpp
-// Hermes with integrated SimpleFOC closed-loop control
-// - AS5600 encoder on I2C
-// - Motor controller with SimpleFOC support
-// - Serial console for control and monitoring
+// Bare-bones Hermes bring-up (ALL-IN-ONE FILE)
+// - AS5600 over I2C
+// - SimpleFOC angle control
+// - Motor ENABLED by default
+// - Target = 0 deg by default (set to current angle to avoid kick recommended)
+// - ONLY serial output: encoder angle + motor angle (in-place with \r)
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <SimpleFOC.h>
 
-#include "Encoder.hpp"
-#include "MotorController.hpp"
-#include "SerialConsole.hpp"
+// ------------------------ USER WIRING ------------------------
+static constexpr int I2C_SDA = 21;
+static constexpr int I2C_SCL = 22;
+static constexpr uint32_t I2C_HZ = 400000;
 
-static AS5600Encoder g_enc;
-static MotorController g_motor;
-static SerialConsole g_console;
+static constexpr int PIN_U  = 25;
+static constexpr int PIN_V  = 26;
+static constexpr int PIN_W  = 27;
+static constexpr int PIN_EN = 33;   // set -1 if your driver has no enable
 
-// ---- AS5600Encoder Configuration ----
-static AS5600Encoder::Config make_encoder_cfg() {
-  AS5600Encoder::Config cfg;
-  cfg.i2c_addr = 0x36;   // AS5600 default
-  cfg.i2c_hz = 400000;
-  cfg.sda_gpio = 21;
-  cfg.scl_gpio = 22;
-  cfg.wrap_deg = 360.0f;
-  return cfg;
-}
+static constexpr int POLE_PAIRS = 7;
+// ------------------------------------------------------------
 
-// ---- Motor Pin Configuration ----
-// IMPORTANT: Update these pins to match your wiring!
-static MotorController::Pins make_motor_pins() {
-  MotorController::Pins p;
-  p.ch1 = 25;  // PWM output 1
-  p.ch2 = 26;  // PWM output 2
-  p.ch3 = 27;  // PWM output 3
-  p.en  = 33;  // enable pin
-  return p;
-}
+// -------------------- CONTROL / TUNING -----------------------
+// Target (deg) - default requested
+static volatile float g_target_deg = 90.0f;
 
-// ---- Motor Configuration with FOC ----
-static MotorController::Config make_motor_cfg() {
-  MotorController::Config c;
-  
-  // PWM settings
-  c.pwm_hz = 20000;     // 20kHz
-  c.pwm_bits = 12;      // 0..4095
-  c.ledc_ch1 = 0;
-  c.ledc_ch2 = 1;
-  c.ledc_ch3 = 2;
-  c.en_active_high = true;
-  
-  // SimpleFOC settings
-  c.use_foc = true;                // ENABLE FOC MODE
-  
-  // Motor parameters - ADJUST FOR YOUR MOTOR!
-  c.pole_pairs = 7.0f;             // Count magnets, divide by 2
-  c.phase_resistance = 2.3f;       // Ohms (0 = auto-detect)
-  c.voltage_limit = 2.0f;         // Max voltage
-  c.velocity_limit = 90.0f;      // Max velocity (deg/s)
-  
-  // Velocity PID tuning
-  c.vel_p = 0.2f;                  // Proportional gain
-  c.vel_i = 20.0f;                 // Integral gain
-  c.vel_d = 0.001f;                // Derivative gain
-  c.vel_ramp = 1000.0f;            // Acceleration limit (deg/s^2)
-  
-  // Position PID tuning
-  c.pos_p = 20.0f;                 // Proportional gain (higher = stiffer)
-  c.pos_i = 0.0f;                  // Usually not needed
-  c.pos_d = 0.0f;                  // Can reduce oscillations
-  c.pos_vel_limit = 1000.0f;       // Max velocity when seeking (deg/s)
-  
-  return c;
-}
+// Print rate (Hz)
+static constexpr uint32_t PRINT_PERIOD_MS = 10; // 100 Hz in-place printing
+
+// Increase responsiveness/stiffness (start here; adjust carefully)
+static constexpr float VOLTAGE_LIMIT_V      = 6.0f;   // higher = more torque authority
+static constexpr float VELOCITY_LIMIT_DPS   = 360.0f; // faster position corrections
+static constexpr float P_ANGLE_P            = 8.0f;   // stiffer position loop
+
+// Optional damping (helps reduce oscillations when you raise stiffness)
+// If your SimpleFOC version exposes P_angle.D, you can use it.
+// Start small.
+static constexpr float P_ANGLE_D            = 0.05f;  // damping (set 0 if not supported)
+
+// Optional velocity loop tuning (can help smoothness)
+// Leave default unless needed.
+static constexpr float PID_VEL_P            = 0.2f;
+static constexpr float PID_VEL_I            = 2.0f;
+static constexpr float PID_VEL_D            = 0.0f;
+// ------------------------------------------------------------
+
+// SimpleFOC objects
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+BLDCMotor motor = BLDCMotor(POLE_PAIRS);
+BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_U, PIN_V, PIN_W, PIN_EN);
+
+static uint32_t g_next_print_ms = 0;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { /* wait */ }
+  while (!Serial) {}
 
-  Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║  Hermes - SimpleFOC Motor Control     ║");
-  Serial.println("╚════════════════════════════════════════╝\n");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(I2C_HZ);
 
-  // Initialize I2C
-  Wire.begin(21, 22);
-  Wire.setClock(400000);
+  // --- Sensor ---
+  sensor.init(&Wire);
 
-  // Initialize encoder
-  const AS5600Encoder::Config enc_cfg = make_encoder_cfg();
-  g_enc.begin(&Wire, enc_cfg);
+  // --- Driver ---
+  driver.voltage_power_supply = 12.0f;
+  driver.pwm_frequency = 20000;
 
-  if (!g_enc.probe()) {
-    Serial.println("⚠  WARNING: AS5600Encoder not detected at 0x36");
-    Serial.println("   Check wiring and I2C address");
-  } else {
-    Serial.println("✓  AS5600Encoder initialized");
-  }
+  // If your driver enable is ACTIVE-LOW, uncomment the next line:
+  // driver.enable_active_high = false;
 
-  // Initialize motor controller with FOC
-  const MotorController::Pins mp = make_motor_pins();
-  const MotorController::Config mc = make_motor_cfg();
-  
-  if (mc.use_foc) {
-    Serial.println("\nInitializing SimpleFOC...");
-    g_motor.begin_foc(mp, mc, &g_enc);
-    Serial.println("✓  FOC mode enabled");
-  } else {
-    Serial.println("\nInitializing PWM mode...");
-    g_motor.begin(mp, mc);
-    Serial.println("✓  PWM mode enabled");
-  }
-  
-  g_motor.safe(); // Ensure disabled at boot
+  driver.init();
 
-  // Initialize console
-  SerialConsole::Config con_cfg;
-  con_cfg.baud = 115200;
-  con_cfg.poll_ms = 1;
-  con_cfg.watch_period_ms = 200;
-  g_console.begin(&g_enc, &g_motor, con_cfg);
+  // IMPORTANT: enable outputs BEFORE initFOC() so alignment can drive phases
+  driver.enable();
 
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║  Setup Complete!                      ║");
-  Serial.println("╚════════════════════════════════════════╝");
-  Serial.println("\nQuick Start Commands:");
-  Serial.println("  help              - Show all commands");
-  Serial.println("  m foc enable      - Enable FOC control");
-  Serial.println("  m foc mode angle  - Position control");
-  Serial.println("  m foc target 90   - Move to 90 degrees");
-  Serial.println("  watch on          - Monitor in real-time");
-  Serial.println();
+  // --- Motor ---
+  motor.linkDriver(&driver);
+  motor.linkSensor(&sensor);
+
+  motor.controller = MotionControlType::angle;
+
+  // Increased authority (responsiveness)
+  motor.voltage_limit  = VOLTAGE_LIMIT_V;
+  motor.velocity_limit = VELOCITY_LIMIT_DPS * DEG_TO_RAD;
+
+  // Stiffer position control
+  motor.P_angle.P = P_ANGLE_P;
+  // Many builds expose these members; if your build errors, delete this line.
+  motor.P_angle.D = P_ANGLE_D;
+
+  // Mild velocity loop settings (optional)
+  motor.PID_velocity.P = PID_VEL_P;
+  motor.PID_velocity.I = PID_VEL_I;
+  motor.PID_velocity.D = PID_VEL_D;
+  motor.PID_velocity.limit = motor.voltage_limit;
+
+  motor.init();
+
+  // Run FOC alignment/calibration (now that driver is enabled)
+  motor.initFOC();
+
+  // Default target:
+  // If you truly want "0 deg by default", keep the next line.
+  // If you want "no kick at boot", comment it out and use the line after it.
+  g_target_deg = 90.0f;
+
+  // Recommended "no kick" option:
+  // g_target_deg = sensor.getAngle() * RAD_TO_DEG;
+
+  g_next_print_ms = millis() + PRINT_PERIOD_MS;
 }
 
 void loop() {
-  const uint32_t now_ms = millis();
-  
-  // Run FOC control loop (CRITICAL - runs as fast as possible!)
-  g_motor.foc_loop();
-  
-  // Handle serial console (less time-critical)
-  g_console.poll(now_ms);
+  motor.loopFOC();
+  motor.move(g_target_deg * DEG_TO_RAD);
+
+  // Continuous in-place output using '\r'
+  const uint32_t now = millis();
+  if ((int32_t)(now - g_next_print_ms) >= 0) {
+    g_next_print_ms = now + PRINT_PERIOD_MS;
+
+    const float enc_deg   = sensor.getAngle() * RAD_TO_DEG;
+    const float motor_deg = motor.shaft_angle * RAD_TO_DEG;
+
+    // Print in-place (no extra text besides the two angles)
+    Serial.print("enc_deg=");
+    Serial.print(enc_deg, 3);
+    Serial.print(" motor_deg=");
+    Serial.print(motor_deg, 3);
+    Serial.print("\r");
+  }
 }
