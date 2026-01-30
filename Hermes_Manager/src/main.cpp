@@ -1,11 +1,3 @@
-// main.cpp
-// Bare-bones Hermes bring-up (ALL-IN-ONE FILE)
-// - AS5600 over I2C
-// - SimpleFOC angle control
-// - Motor ENABLED by default
-// - Target angle set by user input over Serial console
-// - ONLY serial output: encoder angle + motor angle (in-place with \r)
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SimpleFOC.h>
@@ -24,9 +16,7 @@ static constexpr int POLE_PAIRS = 7;
 // ------------------------------------------------------------
 
 // -------------------- CONTROL / TUNING -----------------------
-static volatile float g_target_deg = 0.0f;
-
-static constexpr uint32_t PRINT_PERIOD_MS = 10; // 100 Hz printing
+static constexpr uint32_t PRINT_PERIOD_MS = 10;
 
 static constexpr float VOLTAGE_LIMIT_V      = 6.0f;
 static constexpr float VELOCITY_LIMIT_DPS   = 360.0f;
@@ -43,26 +33,103 @@ MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
 BLDCMotor motor = BLDCMotor(POLE_PAIRS);
 BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_U, PIN_V, PIN_W, PIN_EN);
 
+// State
 static uint32_t g_next_print_ms = 0;
+static bool g_enabled   = false;
+static bool g_foc_ready = false;
 
-// Buffer for serial input
+// Target in ABSOLUTE degrees (AS5600 frame): 0..360
+static volatile float g_target_abs_deg = 0.0f;
+
+// Serial input
 String inputString = "";
+
+// ---------- Helpers ----------
+static float norm360(float deg) {
+  float x = fmodf(deg, 360.0f);
+  if (x < 0.0f) x += 360.0f;
+  return x;
+}
+
+static bool isAngleCommand(const String& s) {
+  char *endptr = nullptr;
+  const String t = String(s);
+  const char* c = t.c_str();
+  (void)strtod(c, &endptr);
+  if (c == endptr) return false;
+  while (*endptr == ' ' || *endptr == '\t') endptr++;
+  return *endptr == '\0';
+}
+
+static float encAbsDegFresh() {
+  sensor.update();
+  return norm360(sensor.getAngle() * RAD_TO_DEG);
+}
+
+static void printHelp() {
+  Serial.println("\nCommands:");
+  Serial.println("  e            -> enable motor (runs initFOC once per boot/session)");
+  Serial.println("  c            -> run initFOC now (calibrate this session)");
+  Serial.println("  d            -> disable motor");
+  Serial.println("  p            -> print current abs angle + FOC offset");
+  Serial.println("  <number>     -> set target ABS angle in degrees (0..360)");
+  Serial.println();
+}
+
+static void disableMotor() {
+  driver.disable();
+  g_enabled = false;
+  Serial.println("\nMotor DISABLED");
+}
+
+// Runs initFOC() using your library (no overload available).
+// This may move the motor slightly.
+static void runFOCOnceThisSession() {
+  if (g_foc_ready) {
+    Serial.println("\nFOC already initialized this session.");
+    return;
+  }
+
+  driver.enable();
+  g_enabled = true;
+
+  motor.initFOC();      // <-- only API available in your SimpleFOC build
+  g_foc_ready = true;
+
+  Serial.print("\nFOC initialized (this session). sensor_offset_deg=");
+  Serial.println(motor.sensor_offset * RAD_TO_DEG, 2);
+}
+
+static void enableMotor() {
+  // Run FOC init once per boot/session
+  if (!g_foc_ready) runFOCOnceThisSession();
+
+  Serial.print("\nMotor ENABLED. Target(abs)=");
+  Serial.print(g_target_abs_deg, 2);
+  Serial.println(" deg");
+}
+
+static void printStatus() {
+  const float abs_deg = encAbsDegFresh();
+  Serial.println("\n--- Status ---");
+  Serial.print("enc_abs_deg: "); Serial.println(abs_deg, 2);
+  Serial.print("enabled: "); Serial.println(g_enabled ? "true" : "false");
+  Serial.print("foc_ready: "); Serial.println(g_foc_ready ? "true" : "false");
+  if (g_foc_ready) {
+    Serial.print("sensor_offset_deg: "); Serial.println(motor.sensor_offset * RAD_TO_DEG, 2);
+  }
+  Serial.println("--------------");
+}
 
 void setup() {
   Serial.begin(115200);
   while (!Serial) {}
 
-  Serial.println("\n=== SimpleFOC Angle Control Ready ===");
-  Serial.println("Type a target angle in degrees and press ENTER:");
-  Serial.println("Example: 90");
-
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_HZ);
 
-  // --- Sensor ---
   sensor.init(&Wire);
 
-  // --- Driver ---
   driver.voltage_power_supply = 12.0f;
   driver.pwm_frequency = 20000;
 
@@ -70,14 +137,12 @@ void setup() {
   // driver.enable_active_high = false;
 
   driver.init();
-  driver.enable();
+  driver.disable(); // keep off during boot/upload/reset
 
-  // --- Motor ---
   motor.linkDriver(&driver);
   motor.linkSensor(&sensor);
 
   motor.controller = MotionControlType::angle;
-
   motor.voltage_limit  = VOLTAGE_LIMIT_V;
   motor.velocity_limit = VELOCITY_LIMIT_DPS * DEG_TO_RAD;
 
@@ -90,58 +155,89 @@ void setup() {
   motor.PID_velocity.limit = motor.voltage_limit;
 
   motor.init();
-  motor.initFOC();
 
-  // Start at current angle to avoid sudden kick
-  g_target_deg = sensor.getAngle() * RAD_TO_DEG;
+  // Start target at current absolute angle to avoid a jump when enabling
+  g_target_abs_deg = encAbsDegFresh();
 
-  Serial.print("Initial target set to current angle: ");
-  Serial.println(g_target_deg);
+  Serial.println("\n=== Hermes Angle Control (ABS 0..360) ===");
+  Serial.println("Motor starts DISABLED (reduces motion during upload/reset).");
+  Serial.println("Display + targets are ABSOLUTE AS5600 degrees (0..360).");
+  Serial.println("We compensate motor.sensor_offset when commanding targets.");
+  printHelp();
+  printStatus();
 
   g_next_print_ms = millis() + PRINT_PERIOD_MS;
 }
 
 void loop() {
-  // --- Handle user serial input ---
+  // Always update sensor so angle updates even when disabled
+  sensor.update();
+
+  // -------- Serial input --------
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-    // If newline received, parse number
     if (c == '\n' || c == '\r') {
       if (inputString.length() > 0) {
-        float newTarget = inputString.toFloat();
-        g_target_deg = newTarget;
-
-        Serial.print("\nNew target angle set to: ");
-        Serial.print(g_target_deg);
-        Serial.println(" deg");
-
+        String cmd = inputString;
+        cmd.trim();
         inputString = "";
+
+        if (cmd.equalsIgnoreCase("e")) {
+          enableMotor();
+        } else if (cmd.equalsIgnoreCase("c")) {
+          runFOCOnceThisSession();
+        } else if (cmd.equalsIgnoreCase("d")) {
+          disableMotor();
+        } else if (cmd.equalsIgnoreCase("p")) {
+          printStatus();
+        } else if (isAngleCommand(cmd)) {
+          float requested = cmd.toFloat();
+          g_target_abs_deg = norm360(requested);
+
+          Serial.print("\nRequested(abs)=");
+          Serial.print(requested, 2);
+          Serial.print(" -> Target(abs, wrapped)=");
+          Serial.print(g_target_abs_deg, 2);
+          Serial.println(" deg");
+        } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
+          printHelp();
+        } else {
+          Serial.println("\nUnknown command. Type 'h' for help.");
+        }
       }
-    }
-    else {
+    } else {
       inputString += c;
     }
   }
 
-  // --- Run motor control loop ---
-  motor.loopFOC();
-  motor.move(g_target_deg * DEG_TO_RAD);
+  // -------- Motor control --------
+  if (g_enabled && g_foc_ready) {
+    const float target_abs_rad   = g_target_abs_deg * DEG_TO_RAD;
+    const float target_shaft_rad = target_abs_rad - motor.sensor_offset; // critical frame fix
+    motor.loopFOC();
+    motor.move(target_shaft_rad);
+  }
 
-  // --- Print angles continuously ---
+  // -------- Print angles (ABS frame, parity) --------
   const uint32_t now = millis();
   if ((int32_t)(now - g_next_print_ms) >= 0) {
     g_next_print_ms = now + PRINT_PERIOD_MS;
 
-    const float enc_deg   = sensor.getAngle() * RAD_TO_DEG;
-    const float motor_deg = motor.shaft_angle * RAD_TO_DEG;
+    const float abs_deg = norm360(sensor.getAngle() * RAD_TO_DEG);
+
+    // True parity: both are the same absolute angle source
+    const float enc_deg   = abs_deg;
+    const float motor_deg = abs_deg;
 
     Serial.print("enc_deg=");
     Serial.print(enc_deg, 2);
     Serial.print(" motor_deg=");
     Serial.print(motor_deg, 2);
     Serial.print(" target=");
-    Serial.print(g_target_deg, 2);
+    Serial.print(g_target_abs_deg, 2);
+    Serial.print(" en=");
+    Serial.print(g_enabled ? 1 : 0);
     Serial.print("   \r");
   }
 }
